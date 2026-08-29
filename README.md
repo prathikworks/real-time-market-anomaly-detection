@@ -57,12 +57,26 @@ pip install -r requirements.txt
 # 3. Run unit tests (offline, no internet needed)
 python -m pytest tests/ -v
 
-# 4a. Replay today's 1-min history to validate detection
+# 4a. Replay today's 1-min history — compact summary (screenshot-friendly)
 python main.py --backtest
 
-# 4b. Start live monitoring (Ctrl-C to stop)
+# 4b. Replay with full article detail (snippet + timestamp + URL per article)
+python main.py --backtest --verbose
+
+# 4c. Start live monitoring (Ctrl-C to stop)
 python main.py
+
+# 4d. Live monitoring with full article detail
+python main.py --verbose
 ```
+
+### CLI flags
+
+| Flag | Default | Description |
+|---|---|---|
+| _(none)_ | — | Live monitoring mode |
+| `--backtest` | — | Replay today's 1-min history end-to-end |
+| `--verbose` | off | Print full article detail per news match (snippet, timestamp, URL). Without it, one compact line per article is shown. Full detail is always written to `market_anomaly.log` at DEBUG level. |
 
 ### How to validate detection logic offline
 

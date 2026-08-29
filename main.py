@@ -30,19 +30,27 @@ from news_fetcher import NewsIngester, build_default_ingester, NewsArticle
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
 
+_stream_handler = logging.StreamHandler(sys.stdout)
+_stream_handler.setLevel(logging.INFO)
+
+_file_handler = logging.FileHandler("market_anomaly.log", encoding="utf-8")
+_file_handler.setLevel(logging.DEBUG)   # full detail always in the log file
+
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
+    level=logging.DEBUG,               # root at DEBUG so handlers can filter
+    format="%(asctime)s  %(levelname)-8s  %(name)s -- %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler("market_anomaly.log", encoding="utf-8"),
-    ],
+    handlers=[_stream_handler, _file_handler],
 )
 logger = logging.getLogger("main")
 
 # Build the news ingester once at module level (reuses HTTP session across events)
 _ingester: NewsIngester = build_default_ingester()
+
+# Verbose mode flag — set to True by --verbose CLI flag.
+# When False: one-line-per-article summary (default, screenshot-friendly).
+# When True:  full detail — snippet, timestamp, URL per article.
+_verbose: bool = False
 
 
 # ── Event handling ────────────────────────────────────────────────────────────
@@ -85,6 +93,13 @@ def _fetch_and_log_news(event: MovementEvent) -> None:
     """
     Fetch relevant news for *event* and log matched headlines.
     Called by on_event() as Stage 2 of the pipeline.
+
+    Output mode is controlled by the module-level ``_verbose`` flag:
+      - Default (INFO):  one condensed line per article — [score] Title (Source)
+      - Verbose (--verbose): full detail — title + snippet + timestamp + URL
+
+    Snippet, timestamp, and URL are always emitted at DEBUG level so they
+    are captured in market_anomaly.log regardless of the console mode.
     """
     articles = _ingester.fetch_for_event(
         event_symbol=event.symbol,
@@ -99,16 +114,32 @@ def _fetch_and_log_news(event: MovementEvent) -> None:
         return
 
     logger.info("%s", news_sep)
-    logger.info("NEWS: %d relevant article(s) found:", len(articles))
+    logger.info("NEWS: %d relevant article(s) | window=+/-%d min | threshold=%.1f",
+                len(articles), config.NEWS_TIME_WINDOW_MINUTES, config.NEWS_RELEVANCE_MIN_SCORE)
+
     for i, art in enumerate(articles, 1):
-        logger.info("  [%d] [score=%.1f] %s", i, art.relevance_score, art.title)
-        if art.description:
-            logger.info("      %s", art.description[:120])
-        logger.info("      Published: %s | Source: %s",
-                    art.published_at.strftime("%Y-%m-%d %H:%M UTC"),
-                    art.source_name)
-        logger.info("      URL: %s", art.url)
+        if _verbose:
+            # ── Verbose: full four-line block ──────────────────────────────
+            logger.info("  [%d] [score=%.1f] %s", i, art.relevance_score, art.title)
+            if art.description:
+                logger.info("      %s", art.description[:120])
+            logger.info("      Published: %s | Source: %s",
+                        art.published_at.strftime("%Y-%m-%d %H:%M UTC"),
+                        art.source_name)
+            logger.info("      URL: %s", art.url)
+        else:
+            # ── Compact: one line, screenshot-friendly ─────────────────────
+            logger.info("  [%d] [%.1f] %s  (%s)",
+                        i, art.relevance_score, art.title, art.source_name)
+            # Always preserve full detail at DEBUG so the log file has it
+            logger.debug("      snippet  : %s", art.description[:120] if art.description else "—")
+            logger.debug("      published: %s", art.published_at.strftime("%Y-%m-%d %H:%M UTC"))
+            logger.debug("      url      : %s", art.url)
+
     logger.info("%s", news_sep)
+    if not _verbose:
+        logger.info("  (run with --verbose for snippet, timestamp, and URL)")
+        logger.info("%s", news_sep)
 
 
 # ── Backtest mode ─────────────────────────────────────────────────────────────
@@ -216,6 +247,8 @@ def run_live() -> None:
 
 
 def main() -> None:
+    global _verbose
+
     parser = argparse.ArgumentParser(
         description="Real-Time Market Anomaly Detection — Iterations 1 & 2"
     )
@@ -224,7 +257,16 @@ def main() -> None:
         action="store_true",
         help="Replay today's 1-min history for detection validation (no live polling).",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help=(
+            "Print full article detail (snippet, timestamp, URL) for each news match. "
+            "Default is one-line-per-article summary."
+        ),
+    )
     args = parser.parse_args()
+    _verbose = args.verbose
 
     if args.backtest:
         run_backtest()
