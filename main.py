@@ -1,15 +1,18 @@
 """
-main.py — Entry point for Iteration 1: live price monitoring loop.
+main.py — Entry point: live price monitoring & backtesting pipeline.
 
 Run modes
-─────────
+---------
   python main.py               # live monitoring (uses config from .env)
   python main.py --backtest    # replay today's 1-min history for each symbol
   python main.py --help        # show options
 
-The script polls each watched symbol every POLL_INTERVAL_SECONDS seconds,
-feeds new prices into a PriceBuffer, runs the detector, and logs any
-MovementEvents found.
+Pipeline (per MovementEvent)
+----------------------------
+  Iteration 1: detect price anomaly -> log
+  Iteration 2: detect -> fetch & filter news -> log headlines
+  Iteration 3: detect -> news -> LLM causal analysis (coming)
+  Iteration 4: detect -> news -> analysis -> notification (coming)
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ from datetime import datetime, timezone
 import config
 import price_monitor as pm
 from detector import check_window, scan_series_for_events, MovementEvent
+from news_fetcher import NewsIngester, build_default_ingester, NewsArticle
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
 
@@ -37,16 +41,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main")
 
+# Build the news ingester once at module level (reuses HTTP session across events)
+_ingester: NewsIngester = build_default_ingester()
+
 
 # ── Event handling ────────────────────────────────────────────────────────────
 
 
 def on_event(event: MovementEvent) -> None:
     """
-    Called whenever a movement event is detected.
+    Central pipeline hook called on every detected MovementEvent.
 
-    Iteration 1: just log it clearly.
-    Iterations 2-4 will add news ingestion → analysis → notification here.
+    Stage 1 (Iteration 1): Log the price anomaly.
+    Stage 2 (Iteration 2): Fetch & filter relevant news headlines.
+    Stage 3 (Iteration 3): LLM causal analysis — TODO.
+    Stage 4 (Iteration 4): Deliver notification — TODO.
     """
     separator = "=" * 72
     logger.warning(separator)
@@ -61,6 +70,45 @@ def on_event(event: MovementEvent) -> None:
     logger.warning("  Threshold   : %.2f%%", event.threshold_used)
     logger.warning("  Detected at : %s", event.detected_at.strftime("%Y-%m-%d %H:%M:%S UTC"))
     logger.warning(separator)
+
+    # ── Stage 2: News ingestion ──────────────────────────────────────────────
+    _fetch_and_log_news(event)
+
+    # ── Stage 3: Causal analysis (Iteration 3 placeholder) ──────────────────
+    # analysis = causal_analysis.analyse(event, articles)  # TODO
+
+    # ── Stage 4: Notification (Iteration 4 placeholder) ─────────────────────
+    # notifier.send(event, analysis)  # TODO
+
+
+def _fetch_and_log_news(event: MovementEvent) -> None:
+    """
+    Fetch relevant news for *event* and log matched headlines.
+    Called by on_event() as Stage 2 of the pipeline.
+    """
+    articles = _ingester.fetch_for_event(
+        event_symbol=event.symbol,
+        event_time=event.detected_at,
+    )
+
+    news_sep = "-" * 72
+    if not articles:
+        logger.info("%s", news_sep)
+        logger.info("NEWS: No relevant articles found for this event.")
+        logger.info("%s", news_sep)
+        return
+
+    logger.info("%s", news_sep)
+    logger.info("NEWS: %d relevant article(s) found:", len(articles))
+    for i, art in enumerate(articles, 1):
+        logger.info("  [%d] [score=%.1f] %s", i, art.relevance_score, art.title)
+        if art.description:
+            logger.info("      %s", art.description[:120])
+        logger.info("      Published: %s | Source: %s",
+                    art.published_at.strftime("%Y-%m-%d %H:%M UTC"),
+                    art.source_name)
+        logger.info("      URL: %s", art.url)
+    logger.info("%s", news_sep)
 
 
 # ── Backtest mode ─────────────────────────────────────────────────────────────
@@ -169,7 +217,7 @@ def run_live() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Real-Time Market Anomaly Detection — Iteration 1"
+        description="Real-Time Market Anomaly Detection — Iterations 1 & 2"
     )
     parser.add_argument(
         "--backtest",

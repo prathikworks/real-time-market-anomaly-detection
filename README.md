@@ -112,10 +112,76 @@ for ev in events:
 
 ---
 
-## Iteration 2 — News Ingestion (coming next)
+## Iteration 2 — News Ingestion ✅
 
-*Will add: RSS/API-based news retrieval triggered on a `MovementEvent`, keyword
-filtering, graceful failure handling.*
+### What was built
+
+| Module | Responsibility |
+|---|---|
+| `relevance_filter.py` | Keyword-based relevance scoring (3-tier weighted keywords). No I/O. Fully unit-testable. |
+| `news_fetcher.py` | `NewsSource` ABC, `NewsAPISource` (newsapi.org), `NewsIngester` orchestrator. Pluggable: add new sources with `register_source()`. |
+| `tests/test_news_ingestion.py` | 39 offline unit tests: scoring, threshold boundaries, mock ingester, raw article parser. |
+| `main.py` (updated) | `on_event()` now calls `_fetch_and_log_news()`. Stage placeholders for Iterations 3 & 4 documented. |
+
+### New config keys
+
+| Config key | Default | Notes |
+|---|---|---|
+| `NEWSAPI_KEY` | _(required)_ | Get a free key at [newsapi.org/register](https://newsapi.org/register) |
+| `NEWS_TIME_WINDOW_MINUTES` | `15` | Articles published within ±15 min of the event |
+| `NEWS_MAX_ARTICLES` | `20` | Max articles fetched per source (free tier cap: 100) |
+| `NEWS_RELEVANCE_MIN_SCORE` | `1.0` | Minimum keyword-weight score. 1.0 = any market term; 3.0 = must name Nifty/Sensex/NSE/BSE |
+
+### Keyword scoring tiers
+
+| Tier | Weight | Examples |
+|---|---|---|
+| 1 | 3.0 | Nifty, Sensex, NSE, BSE, Dalal Street |
+| 2 | 2.0 | RBI, SEBI, FII, repo rate, Union Budget, Rupee, Midcap |
+| 3 | 1.0 | rally, crash, correction, volatile, equity, F&O, IPO |
+
+Scores accumulate across multiple keyword hits. Symbol-specific keywords (e.g. "Nifty" for `^NSEI`) receive a bonus to rank index-specific articles higher.
+
+### How to add a new news source
+
+```python
+# In news_fetcher.py (or a new file), subclass NewsSource:
+class MoneycontrolRSSSource(NewsSource):
+    name = "MoneycontrolRSS"
+
+    def fetch(self, query, from_time, to_time, max_articles):
+        # parse RSS feed, return list[NewsArticle]
+        ...
+
+# In build_default_ingester():
+ingester.register_source(MoneycontrolRSSSource())
+```
+
+### How to test news ingestion without an API key
+
+```bash
+# All 59 unit tests run offline (mocked sources)
+python -m pytest tests/ -v
+```
+
+### NewsAPI free-tier limitations (flagged explicitly)
+
+- Articles are delayed by **~1 hour** on the Developer plan — so a live event at 10:00 IST may not appear in NewsAPI results until ~11:00.
+- **100 requests/day** rate limit. At 60 s polling and events on both symbols, budget carefully.
+- Date range filter has **minute-level precision** only.
+
+For a production system, a paid plan or a direct RSS feed (Moneycontrol, ET Markets) would be preferred. For coursework validation, the developer plan is sufficient.
+
+---
+
+### Open questions / refinements before Iteration 3
+
+1. **NewsAPI delay** — Free tier articles are ~1-hour delayed. For backtest validation this means: run the backtest with yesterday's data and check if articles timestamped around yesterday's events are returned. Live validation is harder without a paid plan.
+2. **Relevance threshold tuning** — `NEWS_RELEVANCE_MIN_SCORE=1.0` is intentionally permissive. If you're seeing too much noise (generic "Indian economy" articles), raise it to `3.0` to require an index name in the headline.
+3. **Query breadth** — The current query is broad ("Nifty OR Sensex OR NSE OR BSE...") to cast a wide net before filtering. If you hit the 100-req/day cap quickly, narrow the query via `NEWS_MAX_ARTICLES`.
+4. **`[Removed]` articles** — NewsAPI marks deleted articles with `[Removed]`; these are discarded. Some relevant articles may be removed by publishers; nothing to do here.
+
+---
 
 ## Iteration 3 — Causal Analysis (planned)
 
