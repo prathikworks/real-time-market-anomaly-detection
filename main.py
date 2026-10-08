@@ -27,6 +27,8 @@ import config
 import price_monitor as pm
 from detector import check_window, scan_series_for_events, MovementEvent
 from news_fetcher import NewsIngester, build_default_ingester, NewsArticle
+from causal_prefilter import rank_for_causality
+from causal_analyzer import CausalAnalyzer, CausalResult, build_default_analyzer
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
 
@@ -46,6 +48,9 @@ logger = logging.getLogger("main")
 
 # Build the news ingester once at module level (reuses HTTP session across events)
 _ingester: NewsIngester = build_default_ingester()
+
+# Build the causal analyzer once (lazy-inits LLM client on first use)
+_analyzer: CausalAnalyzer = build_default_analyzer()
 
 # Verbose mode flag — set to True by --verbose CLI flag.
 # When False: one-line-per-article summary (default, screenshot-friendly).
@@ -80,19 +85,25 @@ def on_event(event: MovementEvent) -> None:
     logger.warning(separator)
 
     # ── Stage 2: News ingestion ──────────────────────────────────────────────
-    _fetch_and_log_news(event)
+    articles = _fetch_and_log_news(event)
 
-    # ── Stage 3: Causal analysis (Iteration 3 placeholder) ──────────────────
-    # analysis = causal_analysis.analyse(event, articles)  # TODO
+    # ── Stage 3: Causal analysis ─────────────────────────────────────────────
+    top_articles = rank_for_causality(
+        articles,
+        event_time=event.detected_at,
+        top_n=config.CAUSAL_TOP_N_ARTICLES,
+    )
+    result = _analyzer.analyse(event, top_articles)
+    _log_causal_result(result)
 
     # ── Stage 4: Notification (Iteration 4 placeholder) ─────────────────────
-    # notifier.send(event, analysis)  # TODO
+    # notifier.send(event, result)  # TODO
 
 
-def _fetch_and_log_news(event: MovementEvent) -> None:
+def _fetch_and_log_news(event: MovementEvent) -> list[NewsArticle]:
     """
-    Fetch relevant news for *event* and log matched headlines.
-    Called by on_event() as Stage 2 of the pipeline.
+    Fetch relevant news for *event*, log matched headlines, and return the
+    article list so Stage 3 (causal analysis) can consume it.
 
     Output mode is controlled by the module-level ``_verbose`` flag:
       - Default (INFO):  one condensed line per article — [score] Title (Source)
@@ -111,7 +122,7 @@ def _fetch_and_log_news(event: MovementEvent) -> None:
         logger.info("%s", news_sep)
         logger.info("NEWS: No relevant articles found for this event.")
         logger.info("%s", news_sep)
-        return
+        return []
 
     logger.info("%s", news_sep)
     logger.info("NEWS: %d relevant article(s) | window=+/-%d min | threshold=%.1f",
@@ -140,6 +151,24 @@ def _fetch_and_log_news(event: MovementEvent) -> None:
     if not _verbose:
         logger.info("  (run with --verbose for snippet, timestamp, and URL)")
         logger.info("%s", news_sep)
+
+    return articles
+
+
+def _log_causal_result(result: CausalResult) -> None:
+    """
+    Log the causal analysis result to the console and log file.
+    Fallback results are flagged clearly so users know the LLM was unavailable.
+    """
+    sep = "~" * 72
+    tag = "[FALLBACK] " if result.is_fallback else ""
+    logger.warning(sep)
+    logger.warning("CAUSAL ANALYSIS  %s[%s]", tag, result.confidence.upper())
+    logger.warning("  %s", result.explanation)
+    if result.source_refs:
+        refs = "; ".join(result.source_refs[:3])
+        logger.warning("  Sources: %s", refs)
+    logger.warning(sep)
 
 
 # ── Backtest mode ─────────────────────────────────────────────────────────────
@@ -264,7 +293,7 @@ def main() -> None:
     global _verbose
 
     parser = argparse.ArgumentParser(
-        description="Real-Time Market Anomaly Detection — Iterations 1 & 2"
+        description="Real-Time Market Anomaly Detection — Iterations 1, 2 & 3"
     )
     parser.add_argument(
         "--backtest",

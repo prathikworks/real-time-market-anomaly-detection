@@ -81,9 +81,20 @@ NEWS_API_KEY: str | None = os.getenv("NEWSAPI_KEY")
 
 # ── Causal Analysis (Iteration 3) ─────────────────────────────────────────────
 
-LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "openai")
-LLM_MODEL: str = os.getenv("LLM_MODEL", "gpt-4o-mini")
-OPENAI_API_KEY: str | None = os.getenv("OPENAI_API_KEY")
+#: Which LLM provider to use for causal analysis.  Currently supported: "gemini".
+LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "gemini")
+
+#: Gemini model name (see https://ai.google.dev/gemini-api/docs/models)
+LLM_MODEL: str = os.getenv("LLM_MODEL", "gemini-1.5-flash")
+
+#: Google Gemini API key (required when LLM_PROVIDER="gemini").
+GEMINI_API_KEY: str | None = os.getenv("GEMINI_API_KEY")
+
+#: How many top causal articles to pass to the LLM.
+CAUSAL_TOP_N_ARTICLES: int = _get_int("CAUSAL_TOP_N_ARTICLES", 3)
+
+#: Per-call LLM timeout in seconds.
+LLM_TIMEOUT_SECONDS: int = _get_int("LLM_TIMEOUT_SECONDS", 20)
 
 # ── Notification (Iteration 4) ────────────────────────────────────────────────
 
