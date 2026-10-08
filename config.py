@@ -85,7 +85,7 @@ NEWS_API_KEY: str | None = os.getenv("NEWSAPI_KEY")
 LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "gemini")
 
 #: Gemini model name (see https://ai.google.dev/gemini-api/docs/models)
-LLM_MODEL: str = os.getenv("LLM_MODEL", "gemini-1.5-flash")
+LLM_MODEL: str = os.getenv("LLM_MODEL", "gemini-3.5-flash")
 
 #: Google Gemini API key (required when LLM_PROVIDER="gemini").
 GEMINI_API_KEY: str | None = os.getenv("GEMINI_API_KEY")

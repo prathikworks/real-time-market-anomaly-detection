@@ -21,7 +21,8 @@ import argparse
 import logging
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import date as _date
+from datetime import datetime, timedelta, timezone
 
 import config
 import price_monitor as pm
@@ -174,25 +175,75 @@ def _log_causal_result(result: CausalResult) -> None:
 # ── Backtest mode ─────────────────────────────────────────────────────────────
 
 
-def run_backtest() -> None:
+def run_backtest(
+    backtest_date: _date | None = None,
+    detect_only: bool = False,
+) -> None:
     """
-    Download today's 1-minute data for each symbol and slide the detection
-    window across the full history.  Prints a summary of all events found.
-    Useful for validating that the detector fires correctly on real data.
+    Slide the detection window across 1-minute history for each symbol.
+
+    Parameters
+    ----------
+    backtest_date:
+        A specific calendar date to replay (YYYY-MM-DD).  Must be within the
+        last 7 days (yfinance 1-min data limit).  ``None`` → today.
+    detect_only:
+        When True, run only price detection and print event counts; skip all
+        NewsAPI and Gemini calls.  Useful for threshold tuning without burning
+        API quota.
     """
+    today = _date.today()
+    if backtest_date is None:
+        backtest_date = today
+
+    # Validate: yfinance keeps only ~7 days of 1-min history.
+    age_days = (today - backtest_date).days
+    if age_days < 0:
+        logger.error("--date %s is in the future. Use a past date.", backtest_date)
+        sys.exit(1)
+    if age_days > 7:
+        logger.error(
+            "--date %s is %d days ago. yfinance only stores ~7 days of 1-min data. "
+            "Use a more recent date or switch to a coarser interval.",
+            backtest_date, age_days,
+        )
+        sys.exit(1)
+
     logger.info("--- BACKTEST MODE ---------------------------------------------------")
+    logger.info("Date         : %s%s", backtest_date,
+                " (today)" if backtest_date == today else "")
     logger.info("Symbols      : %s", ", ".join(config.WATCH_SYMBOLS))
     logger.info("Window       : %d min", config.WINDOW_MINUTES)
     logger.info("Threshold    : %.2f%%", config.ANOMALY_THRESHOLD_PERCENT)
+    if detect_only:
+        logger.info("Mode         : DETECT-ONLY (no NewsAPI / Gemini calls)")
 
     total_events = 0
 
     for symbol in config.WATCH_SYMBOLS:
         logger.info("\nFetching history for %s ...", symbol)
         try:
-            series = pm.fetch_history(symbol, period="1d", interval="1m")
+            if backtest_date == today:
+                series = pm.fetch_history(symbol, period="1d", interval="1m")
+            else:
+                # yfinance: use start/end for specific past day
+                start_dt = datetime.combine(backtest_date,
+                                            datetime.min.time()).replace(tzinfo=timezone.utc)
+                end_dt   = start_dt + timedelta(days=1)
+                series   = pm.fetch_history_range(
+                    symbol,
+                    start=start_dt,
+                    end=end_dt,
+                    interval="1m",
+                )
         except Exception as exc:
             logger.error("  Could not fetch %s: %s", symbol, exc)
+            continue
+
+        if series.empty:
+            logger.warning("  No data returned for %s on %s — "
+                           "market may have been closed or date is outside "
+                           "yfinance's 7-day 1-min window.", symbol, backtest_date)
             continue
 
         logger.info("  %d bars  (%s -> %s)",
@@ -211,6 +262,12 @@ def run_backtest() -> None:
 
         logger.info("  Events found: %d (cooldown=%d min)",
                     len(events), config.EVENT_COOLDOWN_MINUTES)
+
+        if detect_only:
+            for ev in events:
+                logger.info("    %s", ev)
+            total_events += len(events)
+            continue
 
         # Apply news-lookup cap to protect the NewsAPI quota
         cap = config.BACKTEST_MAX_EVENTS_PER_RUN
@@ -298,7 +355,26 @@ def main() -> None:
     parser.add_argument(
         "--backtest",
         action="store_true",
-        help="Replay today's 1-min history for detection validation (no live polling).",
+        help="Replay 1-min history for detection validation (no live polling).",
+    )
+    parser.add_argument(
+        "--date",
+        metavar="YYYY-MM-DD",
+        default=None,
+        help=(
+            "Replay a specific trading day (default: today). "
+            "Must be within the last 7 days (yfinance 1-min data limit). "
+            "Example: --backtest --date 2026-10-07"
+        ),
+    )
+    parser.add_argument(
+        "--detect-only",
+        action="store_true",
+        dest="detect_only",
+        help=(
+            "Backtest mode only: run price detection and print event counts "
+            "without making any NewsAPI or Gemini calls."
+        ),
     )
     parser.add_argument(
         "--verbose",
@@ -311,8 +387,18 @@ def main() -> None:
     args = parser.parse_args()
     _verbose = args.verbose
 
-    if args.backtest:
-        run_backtest()
+    if args.backtest or args.detect_only or args.date:
+        # Parse --date
+        backtest_date: _date | None = None
+        if args.date:
+            try:
+                backtest_date = _date.fromisoformat(args.date)
+            except ValueError:
+                logger.error(
+                    "Invalid --date format %r — expected YYYY-MM-DD.", args.date
+                )
+                sys.exit(1)
+        run_backtest(backtest_date=backtest_date, detect_only=args.detect_only)
     else:
         run_live()
 

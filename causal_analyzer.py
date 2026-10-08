@@ -58,6 +58,50 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# ── Retry helpers ————————————————————————————————————————————————
+
+# HTTP status codes that are never worth retrying (client-side errors).
+_NO_RETRY_STATUSES = frozenset({400, 401, 403, 404})
+
+
+def _extract_http_status(exc_str: str) -> int | None:
+    """
+    Attempt to extract an HTTP status code from an exception message string.
+    Returns the int status code, or None if none found.
+    """
+    import re as _re
+    m = _re.search(r"\b([1-5]\d{2})\b", exc_str)
+    return int(m.group(1)) if m else None
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """
+    Return True iff the exception warrants a retry.
+
+    Retryable  : 429 (rate-limit), 5xx server errors, network/timeout errors.
+    Not-retryable: 400 Bad Request, 401 Unauthorised, 403 Forbidden, 404 Not Found,
+                   or any exception that doesn't look like a transient failure.
+    """
+    exc_str = str(exc).lower()
+
+    # Explicit network / timeout keywords — always transient
+    transient_keywords = ("timeout", "connection", "network", "connectionerror",
+                          "connecttimeout", "readtimeout", "remotedisconnected")
+    if any(k in exc_str for k in transient_keywords):
+        return True
+
+    status = _extract_http_status(str(exc))
+    if status is not None:
+        if status in _NO_RETRY_STATUSES:
+            return False          # definitive client error — don't retry
+        if status == 429 or status >= 500:
+            return True           # rate-limit or server error — retry
+        return False              # other 4xx — don't retry
+
+    # Unknown exception type — retry cautiously (e.g. SDK-internal errors)
+    return True
+
+
 # ── Result dataclass ──────────────────────────────────────────────────────────
 
 
@@ -373,19 +417,29 @@ class CausalAnalyzer:
 
         Pipeline
         ────────
-        1. Build prompt from event + top_articles.
-        2. Send to LLM with timeout and one retry.
-        3. Parse the JSON response.
-        4. Return CausalResult (or fallback on any failure).
+        1. If no articles are available, return a "no news" fallback immediately
+           (no LLM call).
+        2. Build prompt from event + top_articles.
+        3. Send to LLM with timeout, exponential backoff and retry.
+        4. Parse the JSON response.
+        5. Return CausalResult (or fallback on any non-retryable / exhausted error).
 
-        Parameters
-        ----------
-        event:
-            The price MovementEvent to explain.
-        top_articles:
-            Pre-filtered ScoredArticle list (from causal_prefilter).
-            May be empty — the fallback handles this gracefully.
+        Retry policy
+        ────────────
+        - Retried : 429, 5xx, network/timeout errors.
+        - Not retried : 400, 401, 403, 404 — fail immediately.
+        - Backoff  : 2 ** attempt seconds (2 s, 4 s, 8 s …).
         """
+        # Short-circuit: no articles → no point calling the LLM
+        if not top_articles:
+            logger.info("Causal analysis: no articles — returning no-news fallback.")
+            return CausalResult(
+                explanation="No relevant news articles were found around this event.",
+                confidence="none",
+                source_refs=[],
+                is_fallback=True,
+            )
+
         client = self._get_client()
         if client is None:
             return build_fallback_result(top_articles, reason="no LLM client configured")
@@ -409,19 +463,24 @@ class CausalAnalyzer:
                 last_exc = exc
                 exc_str  = str(exc)
 
-                # Rate limit — don't retry
-                if "429" in exc_str or "rate limit" in exc_str.lower():
-                    logger.warning("LLM rate limit hit: %s", exc_str)
+                if not _is_retryable(exc):
+                    logger.warning(
+                        "LLM call failed with non-retryable error: %s", exc_str
+                    )
                     break
 
                 if attempt < self._max_retries:
+                    wait = 2 ** (attempt + 1)   # 2, 4, 8 … seconds
                     logger.warning(
-                        "LLM attempt %d failed (%s) — retrying in 2s …",
+                        "LLM attempt %d/%d failed (%s) — retrying in %ds …",
+                        attempt + 1, self._max_retries + 1, exc_str, wait,
+                    )
+                    time.sleep(wait)
+                else:
+                    logger.error(
+                        "LLM call failed after %d attempt(s): %s",
                         attempt + 1, exc_str,
                     )
-                    time.sleep(2)
-                else:
-                    logger.error("LLM call failed after %d attempt(s): %s", attempt + 1, exc_str)
 
         reason = type(last_exc).__name__ if last_exc else "unknown"
         return build_fallback_result(top_articles, reason=reason)

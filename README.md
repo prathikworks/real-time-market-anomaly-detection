@@ -10,15 +10,22 @@ and delivers a plain-English explanation to the user.
 
 ```
 real-time-market-anomaly-detection/
-├── config.py            # Centralised config loader (reads .env)
-├── detector.py          # Pure anomaly-detection logic (I/O-free, fully testable)
-├── price_monitor.py     # yfinance price fetcher + rolling PriceBuffer
-├── main.py              # Entry point (live monitor + backtest mode)
-├── requirements.txt     # Runtime dependencies
-├── .env.example         # Copy → .env and fill in your values
+├── config.py               # Centralised config loader (reads .env)
+├── detector.py             # Pure anomaly-detection logic (I/O-free, fully testable)
+├── price_monitor.py        # yfinance price fetcher + rolling PriceBuffer
+├── news_fetcher.py         # NewsSource ABC + NewsAPISource + NewsIngester
+├── relevance_filter.py     # Keyword-based article relevance scoring (offline)
+├── causal_prefilter.py     # Offline causal ranking (recency, keywords, source tier)
+├── causal_analyzer.py      # LLM causal analysis layer (Gemini, pluggable)
+├── main.py                 # Entry point — live monitor + backtest mode
+├── requirements.txt        # Runtime dependencies
+├── .env.example            # Copy → .env and fill in your values
 ├── tests/
 │   ├── __init__.py
-│   └── test_detector.py # 20 offline unit tests
+│   ├── test_detector.py        # Iteration 1 — 20 offline unit tests
+│   ├── test_news_ingestion.py  # Iteration 2 — 39 offline unit tests
+│   ├── test_causal_iteration3.py  # Iteration 3 — 37 offline unit tests
+│   └── test_fixes.py           # Targeted fix tests — 33 offline unit tests
 └── README.md
 ```
 
@@ -32,7 +39,7 @@ real-time-market-anomaly-detection/
 |---|---|
 | `config.py` | Loads all config from `.env` and exposes typed constants. |
 | `detector.py` | `check_window()` — tests one snapshot for an anomaly. `scan_series_for_events()` — slides the window across historical data. No I/O. |
-| `price_monitor.py` | `fetch_history()` / `fetch_latest_price()` via yfinance. `PriceBuffer` keeps a 60-min rolling buffer in memory. |
+| `price_monitor.py` | `fetch_history()` / `fetch_history_range()` / `fetch_latest_price()` via yfinance. `PriceBuffer` keeps a 60-min rolling buffer in memory. |
 | `main.py` | Live polling loop (`default`) and historical replay (`--backtest`). `on_event()` is the hook for future iterations. |
 | `tests/test_detector.py` | 20 unit tests: threshold boundaries, edge cases (empty/single/naive index), direction labels, event attributes, backtest scan. |
 
@@ -49,25 +56,28 @@ real-time-market-anomaly-detection/
 
 ```bash
 # 1. Copy and configure
-cp .env.example .env           # edit .env if you want non-default thresholds
+cp .env.example .env           # edit .env with your API keys
 
 # 2. Install dependencies (into existing venv)
 pip install -r requirements.txt
 
-# 3. Run unit tests (offline, no internet needed)
+# 3. Run all unit tests (offline, no internet needed)
 python -m pytest tests/ -v
 
-# 4a. Replay today's 1-min history — compact summary (screenshot-friendly)
+# 4a. Replay today's 1-min history — compact summary
 python main.py --backtest
 
-# 4b. Replay with full article detail (snippet + timestamp + URL per article)
+# 4b. Replay a specific past trading day (must be within last 7 days)
+python main.py --backtest --date 2026-10-07
+
+# 4c. Detection-only (no NewsAPI / Gemini calls — useful for threshold tuning)
+python main.py --detect-only
+
+# 4d. Replay with full article detail (snippet + timestamp + URL)
 python main.py --backtest --verbose
 
-# 4c. Start live monitoring (Ctrl-C to stop)
+# 4e. Start live monitoring (Ctrl-C to stop)
 python main.py
-
-# 4d. Live monitoring with full article detail
-python main.py --verbose
 ```
 
 ### CLI flags
@@ -75,12 +85,14 @@ python main.py --verbose
 | Flag | Default | Description |
 |---|---|---|
 | _(none)_ | — | Live monitoring mode |
-| `--backtest` | — | Replay today's 1-min history end-to-end |
+| `--backtest` | — | Replay 1-min history (today or `--date`) end-to-end |
+| `--date YYYY-MM-DD` | today | Replay a specific past trading day. Must be within last 7 days (yfinance 1-min limit); fails with a clear message if out of range. |
+| `--detect-only` | off | Backtest without any NewsAPI or Gemini calls — prints event counts only. Useful for threshold tuning without burning API quota. |
 | `--verbose` | off | Print full article detail per news match (snippet, timestamp, URL). Without it, one compact line per article is shown. Full detail is always written to `market_anomaly.log` at DEBUG level. |
 
 ### How to validate detection logic offline
 
-The `--backtest` mode downloads today's 1-minute OHLCV bars for each symbol
+The `--backtest` mode downloads 1-minute OHLCV bars for each symbol
 and slides the detection window across the full day.  Any flagged events are
 printed to the console **and** written to `market_anomaly.log`.
 
@@ -174,7 +186,7 @@ ingester.register_source(MoneycontrolRSSSource())
 ### How to test news ingestion without an API key
 
 ```bash
-# All 59 unit tests run offline (mocked sources)
+# All unit tests run offline (mocked sources)
 python -m pytest tests/ -v
 ```
 
@@ -188,19 +200,56 @@ For a production system, a paid plan or a direct RSS feed (Moneycontrol, ET Mark
 
 ---
 
-### Open questions / refinements before Iteration 3
+## Iteration 3 — Causal Analysis ✅
 
-1. **NewsAPI delay** — Free tier articles are ~1-hour delayed. For backtest validation this means: run the backtest with yesterday's data and check if articles timestamped around yesterday's events are returned. Live validation is harder without a paid plan.
-2. **Relevance threshold tuning** — `NEWS_RELEVANCE_MIN_SCORE=1.0` is intentionally permissive. If you're seeing too much noise (generic "Indian economy" articles), raise it to `3.0` to require an index name in the headline.
-3. **Query breadth** — The current query is broad ("Nifty OR Sensex OR NSE OR BSE...") to cast a wide net before filtering. If you hit the 100-req/day cap quickly, narrow the query via `NEWS_MAX_ARTICLES`.
-4. **`[Removed]` articles** — NewsAPI marks deleted articles with `[Removed]`; these are discarded. Some relevant articles may be removed by publishers; nothing to do here.
+### What was built
+
+| Module | Responsibility |
+|---|---|
+| `causal_prefilter.py` | Offline causal ranking (5 factors: recency decay, keyword density, source tier, India specificity, relevance pass-through). No I/O. |
+| `causal_analyzer.py` | Pluggable `LLMClient` ABC, `GeminiClient` implementation, prompt construction, JSON parsing with validation, fallback builder. |
+| `tests/test_causal_iteration3.py` | 37 offline unit tests covering all scoring factors and analyzer behaviour. |
+| `main.py` (updated) | `on_event()` now runs the full pipeline: Detection → News → Pre-filter → LLM → log result. |
+
+### New config keys
+
+| Config key | Default | Notes |
+|---|---|---|
+| `GEMINI_API_KEY` | _(required for LLM)_ | Google AI Studio key — [aistudio.google.com](https://aistudio.google.com) |
+| `LLM_PROVIDER` | `gemini` | Currently only `gemini` supported |
+| `LLM_MODEL` | `gemini-2.5-flash` | Any Gemini model accessible on your key |
+| `CAUSAL_TOP_N_ARTICLES` | `3` | How many top causal articles to send to the LLM |
+| `LLM_TIMEOUT_SECONDS` | `20` | Per-call LLM timeout |
+
+### LLM fallback behaviour
+
+If no articles are found, the LLM is **not called** — a "no relevant news" result is returned immediately.  If the LLM call fails (non-retryable error) or times out, a rule-based fallback using the top headline is returned. The pipeline never crashes due to an LLM failure.
+
+### LLM retry policy
+
+| Condition | Behaviour |
+|---|---|
+| 429 / 5xx / network / timeout | Retry with exponential backoff (2 s, 4 s, 8 s …) |
+| 400 / 401 / 403 / 404 | Fail immediately — no retry |
+| No articles | Skip LLM entirely — return no-news fallback |
 
 ---
 
-## Iteration 3 — Causal Analysis (planned)
+## Fixes applied (post Iteration 3)
 
-*Will add: LLM prompt engineering + configurable API call.*
+| # | File | Fix |
+|---|---|---|
+| 1 | `main.py`, `price_monitor.py` | `--date YYYY-MM-DD` backtest flag: replay a specific past trading day. Validates the 7-day yfinance window; fails with a clear message if date is out of range or in the future. |
+| 2 | `main.py` | `--detect-only` flag: price detection only — no NewsAPI or Gemini calls. Prints event counts. |
+| 3 | `causal_analyzer.py` | Empty article list now short-circuits before any LLM call, returning an immediate "no relevant news" fallback. |
+| 4 | `causal_analyzer.py` | `_is_retryable()` helper: exponential backoff on 429/5xx/network/timeout; no retry on 400/401/403/404. |
+| 5 | `news_fetcher.py` | Query deduplication: `index_name` (Nifty/Sensex) is no longer prepended to the base query when it already appears in it. |
+
+All fixes are covered by offline tests in `tests/test_fixes.py` (33 tests).
+
+---
 
 ## Iteration 4 — Notification (planned)
 
-*Will add: end-to-end pipeline wiring + delivery channel.*
+*Will add: delivery channel (e.g. desktop notification, Telegram, email).*
+

@@ -335,7 +335,8 @@ class TestCausalAnalyzer:
         )
         assert r.is_fallback is True
 
-    def test_no_retry_on_rate_limit(self):
+    def test_429_is_retried(self):
+        """429 is now treated as retryable (rate-limit is transient)."""
         from causal_analyzer import CausalAnalyzer, LLMClient
 
         call_count = []
@@ -343,12 +344,14 @@ class TestCausalAnalyzer:
         class RateLimitClient(LLMClient):
             def complete(self, prompt: str, timeout_seconds: float = 20.0) -> str:
                 call_count.append(1)
-                raise Exception("429 rate limit exceeded")
+                raise Exception("429 Too Many Requests")
 
-        CausalAnalyzer(client=RateLimitClient(), max_retries=2).analyse(
-            _make_event(), self._scored()
-        )
-        assert len(call_count) == 1, "Must NOT retry on 429"
+        with patch("causal_analyzer.time.sleep"):
+            CausalAnalyzer(client=RateLimitClient(), max_retries=1).analyse(
+                _make_event(), self._scored()
+            )
+        # max_retries=1 → 2 total attempts (1 original + 1 retry)
+        assert len(call_count) == 2, "429 should be retried once"
 
     def test_retries_on_transient_error(self):
         from causal_analyzer import CausalAnalyzer, LLMClient
@@ -376,10 +379,14 @@ class TestCausalAnalyzer:
         assert r.explanation == "Recovered on retry."
 
     def test_empty_articles_no_crash(self):
+        """Empty articles now short-circuit before LLM — always returns is_fallback=True."""
         from causal_analyzer import CausalAnalyzer, LLMClient
+
+        llm_called = []
 
         class MockClient(LLMClient):
             def complete(self, prompt: str, timeout_seconds: float = 20.0) -> str:
+                llm_called.append(1)
                 return json.dumps({
                     "explanation": "No clear cause found.",
                     "confidence": "none",
@@ -388,3 +395,5 @@ class TestCausalAnalyzer:
 
         r = CausalAnalyzer(client=MockClient()).analyse(_make_event(), [])
         assert isinstance(r.explanation, str) and len(r.explanation) > 0
+        assert r.is_fallback is True
+        assert len(llm_called) == 0, "LLM must NOT be called when articles list is empty"

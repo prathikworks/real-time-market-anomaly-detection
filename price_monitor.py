@@ -75,6 +75,44 @@ def fetch_history(
     return series
 
 
+def fetch_history_range(
+    symbol: str,
+    start: datetime,
+    end: datetime,
+    interval: str = "1m",
+) -> pd.Series:
+    """
+    Download 1-minute bars for *symbol* between *start* and *end* (both UTC).
+
+    Used by the ``--date`` backtest option to replay a specific past trading day.
+    yfinance supports ``start``/``end`` with ``interval="1m"`` for up to 7 days ago.
+
+    Returns
+    -------
+    pd.Series with DatetimeIndex (UTC-aware), sorted oldest→newest.
+    May be empty if the market was closed or the date is outside the 7-day window.
+    Raises on network failure.
+    """
+    logger.debug(
+        "Fetching history range: symbol=%s start=%s end=%s interval=%s",
+        symbol, start.isoformat(), end.isoformat(), interval,
+    )
+    ticker = yf.Ticker(symbol)
+    df = ticker.history(start=start, end=end, interval=interval, auto_adjust=True)
+    if df.empty:
+        return pd.Series(dtype=float)
+    series = df["Close"].dropna()
+    series.index = series.index.tz_convert("UTC")
+    series = series.sort_index()
+    logger.info(
+        "Fetched %d bars for %s in range [%s, %s]",
+        len(series), symbol,
+        start.strftime("%Y-%m-%d"),
+        end.strftime("%Y-%m-%d"),
+    )
+    return series
+
+
 def fetch_latest_price(symbol: str) -> tuple[datetime, float]:
     """
     Fetch the single most-recent close price for *symbol*.

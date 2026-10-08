@@ -322,7 +322,12 @@ class NewsIngester:
         to_time = event_time + timedelta(minutes=win)
 
         index_name = self._SYMBOL_NAMES.get(event_symbol, event_symbol)
-        query = f"{index_name} OR {self._BASE_QUERY}"
+        # Only prepend index_name if it isn't already in the base query,
+        # to avoid duplicates like "Nifty OR Nifty OR Sensex OR ...".
+        if index_name.lower() in self._BASE_QUERY.lower():
+            query = self._BASE_QUERY
+        else:
+            query = f"{index_name} OR {self._BASE_QUERY}"
 
         logger.info(
             "News fetch: symbol=%s  window=+/-%d min  [%s -> %s]",
