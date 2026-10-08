@@ -177,10 +177,24 @@ def run_backtest() -> None:
             window_minutes=config.WINDOW_MINUTES,
             threshold_pct=config.ANOMALY_THRESHOLD_PERCENT,
             step_minutes=1,
+            cooldown_minutes=config.EVENT_COOLDOWN_MINUTES,
         )
 
-        logger.info("  Events found: %d", len(events))
-        for ev in events:
+        logger.info("  Events found: %d (cooldown=%d min)",
+                    len(events), config.EVENT_COOLDOWN_MINUTES)
+
+        # Apply news-lookup cap to protect the NewsAPI quota
+        cap = config.BACKTEST_MAX_EVENTS_PER_RUN
+        events_for_news = events if cap == 0 else events[:cap]
+        if cap > 0 and len(events) > cap:
+            logger.warning(
+                "  [CAP] %d event(s) found but only %d will trigger news lookup "
+                "(BACKTEST_MAX_EVENTS_PER_RUN=%d). "
+                "Lower the threshold or raise the cap to process all.",
+                len(events), cap, cap,
+            )
+
+        for ev in events_for_news:
             on_event(ev)
 
         total_events += len(events)

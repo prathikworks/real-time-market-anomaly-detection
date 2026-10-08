@@ -15,12 +15,23 @@ exceeds a configurable threshold:
     pct_change = (price_now - price_window_start) / price_window_start * 100
 
 If |pct_change| >= threshold → MovementEvent is returned.
+
+Bug-fix history
+───────────────
+v1.1  Fixed check_window(): the window must be sliced to [now-W, now]
+      from both ends, not just from the left.  The original code kept
+      the full tail of the series as "window_data", so iloc[-1] was
+      always the last bar of the day instead of the bar closest to
+      `now` — producing reported windows of hundreds of minutes.
+
+      Fixed scan_series_for_events(): added cooldown suppression so a
+      sustained trend produces one event, not one per step-minute.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -42,7 +53,7 @@ class MovementEvent:
     price_start: float             # price at window_start
     price_end: float               # price at window_end
     pct_change: float              # signed % change (negative = drop)
-    window_minutes: int            # actual elapsed minutes
+    window_minutes: int            # actual elapsed minutes (should be <= WINDOW_MINUTES)
     threshold_used: float          # threshold that was applied
 
     @property
@@ -70,30 +81,43 @@ def check_window(
     now: datetime | None = None,
 ) -> MovementEvent | None:
     """
-    Inspect the most-recent ``window_minutes`` of price data and return a
-    :class:`MovementEvent` if the threshold is breached, else ``None``.
+    Inspect the ``window_minutes``-wide slice of price data ending at ``now``
+    and return a :class:`MovementEvent` if the threshold is breached.
 
     Parameters
     ----------
     series:
         A ``pd.Series`` with a ``DatetimeIndex`` (timezone-aware) and float
-        price values, sorted oldest→newest.
+        price values.  May be longer than ``window_minutes``; this function
+        always slices it to exactly ``[now - window_minutes, now]``.
     symbol:
         Human-readable name for the index (used in log messages / event).
     window_minutes:
-        How far back (in minutes) from the latest data point to look.
+        Width of the detection window in minutes.
     threshold_pct:
         Minimum absolute % change to flag as an anomaly.
     now:
-        Override for "current time" — useful for testing.  When ``None``
+        Override for "current time" — useful for backtesting.  When ``None``
         the latest timestamp in *series* is used as the reference point.
 
     Returns
     -------
     MovementEvent | None
+
+    Notes
+    -----
+    **Key implementation constraint**: the window is sliced from *both* ends:
+
+        window_data = series[(series.index >= window_start_time)
+                             & (series.index <= reference_time)]
+
+    Without the upper-bound filter the last bar in the series (often the
+    end of the trading day) bleeds into every earlier window, causing
+    the reported duration to be hundreds of minutes and the % change to
+    reflect the full-day move rather than the 5-minute move.
     """
     if series.empty:
-        logger.debug("%s: empty series — skipping.", symbol)
+        logger.debug("%s: empty series -- skipping.", symbol)
         return None
 
     # Ensure index is a DatetimeIndex
@@ -107,16 +131,29 @@ def check_window(
 
     series = series.sort_index()
 
+    # ── Reference point and window bounds ────────────────────────────────────
     reference_time: datetime = now if now is not None else series.index[-1].to_pydatetime()
+    # Normalise to UTC-aware if caller passed a naive datetime
+    if reference_time.tzinfo is None:
+        reference_time = reference_time.replace(tzinfo=timezone.utc)
+
     window_start_time: datetime = reference_time - timedelta(minutes=window_minutes)
 
-    window_data = series[series.index >= window_start_time]
+    # CRITICAL: filter BOTH ends so the window is exactly [start, now].
+    # Without the upper-bound (series.index <= reference_time) the slice
+    # includes all future bars up to the end of the series, making
+    # window_data.iloc[-1] always the last bar of the day.
+    window_data = series[
+        (series.index >= window_start_time) & (series.index <= reference_time)
+    ]
 
     if len(window_data) < 2:
         logger.debug(
-            "%s: only %d data point(s) in window — need at least 2.",
+            "%s: only %d data point(s) in window [%s -> %s] -- need at least 2.",
             symbol,
             len(window_data),
+            window_start_time.strftime("%H:%M:%S"),
+            reference_time.strftime("%H:%M:%S"),
         )
         return None
 
@@ -124,7 +161,7 @@ def check_window(
     price_end = float(window_data.iloc[-1])
 
     if price_start == 0:
-        logger.warning("%s: price_start is 0 — cannot compute % change.", symbol)
+        logger.warning("%s: price_start is 0 -- cannot compute %% change.", symbol)
         return None
 
     pct_change = (price_end - price_start) / price_start * 100
@@ -133,7 +170,7 @@ def check_window(
     )
 
     logger.debug(
-        "%s: window [%s → %s]  %.2f → %.2f  (%+.3f%%)",
+        "%s: window [%s -> %s]  %.2f -> %.2f  (%+.3f%%)",
         symbol,
         window_data.index[0].strftime("%H:%M:%S"),
         window_data.index[-1].strftime("%H:%M:%S"),
@@ -160,6 +197,9 @@ def check_window(
     return None
 
 
+# ── Backtest scan with cooldown ───────────────────────────────────────────────
+
+
 def scan_series_for_events(
     series: pd.Series,
     *,
@@ -167,11 +207,11 @@ def scan_series_for_events(
     window_minutes: int,
     threshold_pct: float,
     step_minutes: int = 1,
+    cooldown_minutes: int = 15,
 ) -> list[MovementEvent]:
     """
-    Slide a rolling window across *series* and collect **all** anomaly events.
-
-    Useful for back-testing / validating detection logic against historical data.
+    Slide a rolling window across *series* and collect anomaly events,
+    applying a cooldown to avoid flooding on sustained trends.
 
     Parameters
     ----------
@@ -185,11 +225,20 @@ def scan_series_for_events(
         Alert threshold (absolute %).
     step_minutes:
         How many minutes to advance the window on each step (default 1 min).
-        Smaller = finer scan; larger = faster but may miss short spikes.
+    cooldown_minutes:
+        After an event fires, suppress further events for this many minutes.
+        Default 15.  Set to 0 to disable (not recommended for backtests).
 
     Returns
     -------
-    List of :class:`MovementEvent` objects, one per breached window.
+    List of :class:`MovementEvent` objects after deduplication.
+
+    Design notes
+    ────────────
+    Cooldown is applied at the *scan* level, not inside check_window, so
+    check_window remains pure and testable in isolation.  When cooldown is
+    active the loop simply skips check_window entirely, avoiding both
+    spurious events and wasted computation.
     """
     if series.empty:
         return []
@@ -201,11 +250,19 @@ def scan_series_for_events(
     series = series.sort_index()
 
     events: list[MovementEvent] = []
+    cooldown_until: datetime | None = None  # None = no active cooldown
+
     start = series.index[0].to_pydatetime() + timedelta(minutes=window_minutes)
-    end = series.index[-1].to_pydatetime()
+    end   = series.index[-1].to_pydatetime()
 
     current = start
     while current <= end:
+
+        # ── Cooldown suppression ──────────────────────────────────────────────
+        if cooldown_until is not None and current < cooldown_until:
+            current += timedelta(minutes=step_minutes)
+            continue
+
         event = check_window(
             series,
             symbol=symbol,
@@ -213,8 +270,12 @@ def scan_series_for_events(
             threshold_pct=threshold_pct,
             now=current,
         )
+
         if event is not None:
             events.append(event)
+            if cooldown_minutes > 0:
+                cooldown_until = current + timedelta(minutes=cooldown_minutes)
+
         current += timedelta(minutes=step_minutes)
 
     return events

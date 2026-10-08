@@ -265,3 +265,173 @@ class TestScanSeriesForEvents:
         )
         for ev in events:
             assert ev.symbol == "MY_INDEX"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Bug-fix tests — window enforcement and cooldown
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestWindowEnforcement:
+    """
+    Verify that the reported window duration never exceeds WINDOW_MINUTES.
+
+    Pre-fix behaviour: check_window sliced only the lower bound of the series
+    (series.index >= start), so window_data.iloc[-1] was always the last bar
+    of the full series, not the bar closest to `now`.  Result: windows of
+    hundreds of minutes and % changes spanning the full trading day.
+    """
+
+    def test_window_duration_never_exceeds_window_minutes(self):
+        """
+        Even when the full series is much longer than WINDOW_MINUTES, the
+        returned event's window_minutes must be <= WINDOW_MINUTES.
+        """
+        # 90-minute series: flat 85 min, then +1% spike in final 5 min
+        flat  = [100.0] * 85
+        spike = [101.0] * 5
+        series = make_series(flat + spike, freq_seconds=60)
+        last_ts = series.index[-1].to_pydatetime()
+
+        event = check_window(
+            series, symbol=SYMBOL,
+            window_minutes=5, threshold_pct=0.5, now=last_ts,
+        )
+        assert event is not None, "Expected an event for a 1% spike"
+        assert event.window_minutes <= 5, (
+            f"window_minutes={event.window_minutes} exceeds WINDOW_MINUTES=5. "
+            "The upper-bound filter on the series slice is broken."
+        )
+
+    def test_pct_change_reflects_only_window_not_full_day(self):
+        """
+        A 1% spike at the end of a flat day should yield ~1%, not the
+        full-day change from bar[0] to bar[-1].
+        """
+        flat  = [100.0] * 60
+        spike = [100.0, 100.5, 101.0]
+        series = make_series(flat + spike, freq_seconds=60)
+        last_ts = series.index[-1].to_pydatetime()
+
+        event = check_window(
+            series, symbol=SYMBOL,
+            window_minutes=5, threshold_pct=0.5, now=last_ts,
+        )
+        assert event is not None
+        assert 0.5 <= abs(event.pct_change) <= 2.0, (
+            f"pct_change={event.pct_change:.2f}% looks like it came from outside "
+            "the window -- upper-bound filter may be broken."
+        )
+
+    def test_mid_series_window_does_not_include_future_bars(self):
+        """
+        Querying at an intermediate `now` must not pull in bars that come
+        later in the series, even though they exist in the passed Series.
+        """
+        # Flat for first 10 bars, then big jump at bar 11+
+        prices = [100.0] * 10 + [110.0] * 10
+        series = make_series(prices, freq_seconds=60)
+        # `now` is inside the flat region -- no spike should be visible
+        now = BASE_TIME + timedelta(minutes=8)
+
+        event = check_window(
+            series, symbol=SYMBOL,
+            window_minutes=5, threshold_pct=1.0, now=now,
+        )
+        assert event is None, (
+            "Detected a spike that hasn't happened yet -- future bars are leaking "
+            "into the window. The upper-bound filter is broken."
+        )
+
+    def test_window_end_timestamp_bounded_by_now(self):
+        """The event's window_end must be <= now."""
+        series = make_series([100.0] * 5 + [101.5] * 25, freq_seconds=60)
+        now = BASE_TIME + timedelta(minutes=10)
+
+        event = check_window(
+            series, symbol=SYMBOL,
+            window_minutes=5, threshold_pct=0.5, now=now,
+        )
+        if event is not None:
+            assert event.window_end <= now, (
+                f"window_end {event.window_end} is after now {now}. "
+                "Upper-bound filter missing."
+            )
+
+
+class TestCooldown:
+    """
+    Verify that scan_series_for_events() applies the cooldown correctly so
+    a sustained trend produces one event, not one per step-minute.
+    """
+
+    @staticmethod
+    def _sustained_series(n_flat: int = 5, n_trend: int = 20) -> pd.Series:
+        flat  = [100.0] * n_flat
+        # Steep: +10% over n_trend bars so every 5-bar window easily breaches 0.5%
+        trend = [100.0 + (10.0 * i / n_trend) for i in range(1, n_trend + 1)]
+        return make_series(flat + trend, freq_seconds=60)
+
+    def test_sustained_trend_with_cooldown_produces_few_events(self):
+        """
+        A 2% trend over 20 minutes with a 15-min cooldown should produce
+        at most 2 events, not 20.
+        """
+        events = scan_series_for_events(
+            self._sustained_series(),
+            symbol=SYMBOL,
+            window_minutes=5, threshold_pct=0.5,
+            step_minutes=1, cooldown_minutes=15,
+        )
+        assert len(events) <= 2, (
+            f"Got {len(events)} events for a sustained trend with 15-min cooldown. "
+            "Cooldown is not suppressing duplicates."
+        )
+
+    def test_cooldown_zero_disables_suppression(self):
+        """cooldown_minutes=0 must allow every breaching window through."""
+        series = self._sustained_series()
+        no_cd = scan_series_for_events(
+            series, symbol=SYMBOL,
+            window_minutes=5, threshold_pct=0.5,
+            step_minutes=1, cooldown_minutes=0,
+        )
+        with_cd = scan_series_for_events(
+            series, symbol=SYMBOL,
+            window_minutes=5, threshold_pct=0.5,
+            step_minutes=1, cooldown_minutes=15,
+        )
+        assert len(no_cd) > len(with_cd), (
+            "Expected more events with cooldown disabled than with it enabled."
+        )
+
+    def test_two_separate_spikes_both_reported(self):
+        """Two genuine spikes >cooldown apart should each produce one event."""
+        prices = (
+            [100.0] * 5 + [102.0] * 2    # spike 1: +2% at t=5-6
+            + [102.0] * 16               # quiet plateau
+            + [104.0] * 2               # spike 2: another +2% at t=23-24
+            + [104.0] * 5
+        )
+        series = make_series(prices, freq_seconds=60)
+        events = scan_series_for_events(
+            series, symbol=SYMBOL,
+            window_minutes=3, threshold_pct=1.5,
+            step_minutes=1, cooldown_minutes=10,
+        )
+        assert len(events) >= 2, (
+            f"Expected >=2 events for two distinct spikes, got {len(events)}."
+        )
+
+    def test_long_cooldown_suppresses_second_event(self):
+        """A cooldown longer than the series forces at most one event."""
+        prices = [100.0] * 5 + [102.0] * 20
+        series = make_series(prices, freq_seconds=60)
+        events = scan_series_for_events(
+            series, symbol=SYMBOL,
+            window_minutes=3, threshold_pct=1.5,
+            step_minutes=1, cooldown_minutes=60,
+        )
+        assert len(events) == 1, (
+            f"Expected exactly 1 event with 60-min cooldown, got {len(events)}."
+        )

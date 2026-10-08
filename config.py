@@ -55,6 +55,15 @@ ANOMALY_THRESHOLD_PERCENT: float = _get_float("ANOMALY_THRESHOLD_PERCENT", 0.5)
 #: ^NSEI = Nifty 50,  ^BSESN = BSE Sensex
 WATCH_SYMBOLS: list[str] = _get_list("WATCH_SYMBOLS", ["^NSEI", "^BSESN"])
 
+#: After an event fires, suppress further events for this many minutes.
+#: Prevents dozens of duplicate alerts during a sustained trend.
+EVENT_COOLDOWN_MINUTES: int = _get_int("EVENT_COOLDOWN_MINUTES", 15)
+
+#: Maximum events per symbol per backtest run that will trigger a news lookup.
+#: Protects the NewsAPI free-tier quota (100 req/day) from runaway scans.
+#: Set to 0 to disable the cap (unlimited, use with caution).
+BACKTEST_MAX_EVENTS_PER_RUN: int = _get_int("BACKTEST_MAX_EVENTS_PER_RUN", 10)
+
 # ── News Ingestion (Iteration 2) ───────────────────────────────────────────────
 
 #: Minutes around a movement event to search for news articles.
