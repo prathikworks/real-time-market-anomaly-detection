@@ -115,15 +115,42 @@ _INDIA_NEGATIVE_PURE_US = re.compile(
     re.IGNORECASE,
 )
 
+# ── Broad-market vs single-stock patterns ─────────────────────────────────────
+
+# Patterns that signal the article covers broad index-level market movement
+_BROAD_MARKET = re.compile(
+    r"(?:"
+    r"Sensex|Nifty|BSE|NSE|Dalal Street"
+    r"|Indian (?:market|bourses|equities|stocks)"
+    r"|market (?:fall|crash|drop|slump|sell.?off|correction|decline|slide|surge|rally)"
+    r"|index (?:fall|drop|decline|surge|rally|close|end)"
+    r"|benchmark (?:index|indices)"
+    r"|broad.?based (?:sell|fall|drop|rise)"
+    r")",
+    re.IGNORECASE,
+)
+
+# Patterns that signal the article is ONLY about a single named company's stock
+# without referencing the broader market
+_SINGLE_STOCK_ONLY = re.compile(
+    r"(?:"
+    r"shares? (?:crash|surge|jump|fall|drop|rise|gain|hit|rally)"
+    r"|stock (?:crash|surge|jump|fall|drop|rise|gain|hit)"
+    r"|(?:hits?|touches?) (?:new|52.week|all.time) (?:high|low)"
+    r")",
+    re.IGNORECASE,
+)
+
 # ── Scoring weights (must sum to 1.0) ────────────────────────────────────────
 
-_W_RECENCY   = 0.35
-_W_KEYWORDS  = 0.25
-_W_SOURCE    = 0.15
-_W_INDIA     = 0.15
-_W_RELEVANCE = 0.10
+_W_RECENCY    = 0.35
+_W_KEYWORDS   = 0.10   # reduced; weight moved to broadcast factor
+_W_SOURCE     = 0.15
+_W_INDIA      = 0.15
+_W_BROADCAST  = 0.15   # new: broad-market vs single-stock disambiguation
+_W_RELEVANCE  = 0.10
 
-assert abs(_W_RECENCY + _W_KEYWORDS + _W_SOURCE + _W_INDIA + _W_RELEVANCE - 1.0) < 1e-9
+assert abs(_W_RECENCY + _W_KEYWORDS + _W_SOURCE + _W_INDIA + _W_BROADCAST + _W_RELEVANCE - 1.0) < 1e-9
 
 # Exponential decay half-life in minutes for recency scoring
 _DECAY_HALFLIFE_MIN = 30.0
@@ -142,13 +169,15 @@ class ScoredArticle:
     keyword_score: float
     source_score: float
     india_score: float
+    broadcast_score: float       # broad-market vs single-stock disambiguation
     relevance_score_norm: float  # the Iteration-2 relevance score, normalised
 
     def __str__(self) -> str:
         return (
             f"[causal={self.causal_score:.3f}] "
             f"[rec={self.recency_score:.2f} kw={self.keyword_score:.2f} "
-            f"src={self.source_score:.2f} in={self.india_score:.2f}] "
+            f"src={self.source_score:.2f} in={self.india_score:.2f} "
+            f"bc={self.broadcast_score:.2f}] "
             f"{self.article.title[:80]}"
         )
 
@@ -190,14 +219,16 @@ def rank_for_causality(
         kw    = _keyword_score(art)
         src   = _source_score(art)
         india = _india_score(art)
+        bc    = _broadcast_score(art)
         rel_n = art.relevance_score / max_rel
 
         total = (
-            _W_RECENCY   * rec
-            + _W_KEYWORDS  * kw
-            + _W_SOURCE    * src
-            + _W_INDIA     * india
-            + _W_RELEVANCE * rel_n
+            _W_RECENCY    * rec
+            + _W_KEYWORDS   * kw
+            + _W_SOURCE     * src
+            + _W_INDIA      * india
+            + _W_BROADCAST  * bc
+            + _W_RELEVANCE  * rel_n
         )
         scored.append(ScoredArticle(
             article=art,
@@ -206,6 +237,7 @@ def rank_for_causality(
             keyword_score=round(kw, 4),
             source_score=round(src, 4),
             india_score=round(india, 4),
+            broadcast_score=round(bc, 4),
             relevance_score_norm=round(rel_n, 4),
         ))
         logger.debug(str(scored[-1]))
@@ -276,3 +308,30 @@ def _india_score(art: "NewsArticle") -> float:
     if india_hits == 0 and us_hits > 0:
         return 0.1                             # US-only penalty
     return 0.5                                 # neutral / no signal
+
+
+def _broadcast_score(art: "NewsArticle") -> float:
+    """
+    Score in [0, 1] reflecting whether the article covers broad market-wide
+    news (high score) versus a single-company stock-price story (low score).
+
+    This helps ensure that an article like "Sensex plummets 1,000 points"
+    ranks above "PB Fintech shares crash 50%" when explaining an index move.
+
+    Returns
+    -------
+    1.0  — clear broad-market / index-level article
+    0.6  — neutral (no strong signal either way)
+    0.3  — looks like a single-stock price-action article only
+    """
+    text = f"{art.title} {art.description}"
+    broad_hits  = len(_BROAD_MARKET.findall(text))
+    single_hits = len(_SINGLE_STOCK_ONLY.findall(text))
+
+    if broad_hits > 0 and single_hits == 0:
+        return 1.0   # clearly about the index / broad market
+    if broad_hits > 0 and single_hits > 0:
+        return 0.7   # index context present but also stock-specific
+    if broad_hits == 0 and single_hits > 0:
+        return 0.3   # individual-stock story — weak causal link to index move
+    return 0.6       # neutral / no clear signal

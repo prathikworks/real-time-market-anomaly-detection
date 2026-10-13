@@ -75,26 +75,18 @@ NEWS_MAX_ARTICLES: int = _get_int("NEWS_MAX_ARTICLES", 20)
 #: Minimum relevance score an article must reach to pass the filter.
 #: Score is a cumulative keyword-weight sum (see relevance_filter.py).
 #: 1.0 = at least one Tier-3 keyword hit; 3.0 = at least one Tier-1 (index name).
-NEWS_RELEVANCE_MIN_SCORE: float = _get_float("NEWS_RELEVANCE_MIN_SCORE", 1.0)
+NEWS_RELEVANCE_MIN_SCORE: float = _get_float("NEWS_RELEVANCE_MIN_SCORE", 3.0)
 
 NEWS_API_KEY: str | None = os.getenv("NEWSAPI_KEY")
 
-# ── Causal Analysis (Iteration 3) ─────────────────────────────────────────────
+# ── Causal Context (Rule-Based, no LLM required) ──────────────────────────────
 
-#: Which LLM provider to use for causal analysis.  Currently supported: "gemini".
-LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "gemini")
+#: How many top causal articles to pass through the rule-based scoring pipeline.
+#: A larger pool gives the scorer more candidates to choose from.
+CAUSAL_TOP_N_ARTICLES: int = _get_int("CAUSAL_TOP_N_ARTICLES", 7)
 
-#: Gemini model name (see https://ai.google.dev/gemini-api/docs/models)
-LLM_MODEL: str = os.getenv("LLM_MODEL", "gemini-3.5-flash")
-
-#: Google Gemini API key (required when LLM_PROVIDER="gemini").
-GEMINI_API_KEY: str | None = os.getenv("GEMINI_API_KEY")
-
-#: How many top causal articles to pass to the LLM.
-CAUSAL_TOP_N_ARTICLES: int = _get_int("CAUSAL_TOP_N_ARTICLES", 3)
-
-#: Per-call LLM timeout in seconds.
-LLM_TIMEOUT_SECONDS: int = _get_int("LLM_TIMEOUT_SECONDS", 20)
+#: How many ranked articles to display in the output per event.
+CAUSAL_TOP_N_DISPLAY: int = _get_int("CAUSAL_TOP_N_DISPLAY", 5)
 
 # ── Notification (Iteration 4) ────────────────────────────────────────────────
 

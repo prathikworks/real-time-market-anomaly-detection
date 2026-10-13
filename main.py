@@ -9,10 +9,11 @@ Run modes
 
 Pipeline (per MovementEvent)
 ----------------------------
-  Iteration 1: detect price anomaly -> log
-  Iteration 2: detect -> fetch & filter news -> log headlines
-  Iteration 3: detect -> news -> LLM causal analysis (coming)
-  Iteration 4: detect -> news -> analysis -> notification (coming)
+  1. Detect price anomaly.
+  2. Fetch & filter news articles from NewsAPI within the time window.
+  3. Score and rank articles with deterministic rule-based analysis.
+  4. Display top ranked news as possible context (no LLM required).
+  5. Notification (placeholder — extend in Stage 4).
 """
 
 from __future__ import annotations
@@ -66,10 +67,10 @@ def on_event(event: MovementEvent) -> None:
     """
     Central pipeline hook called on every detected MovementEvent.
 
-    Stage 1 (Iteration 1): Log the price anomaly.
-    Stage 2 (Iteration 2): Fetch & filter relevant news headlines.
-    Stage 3 (Iteration 3): LLM causal analysis — TODO.
-    Stage 4 (Iteration 4): Deliver notification — TODO.
+    Stage 1: Log the price anomaly.
+    Stage 2: Fetch & filter relevant news headlines.
+    Stage 3: Rule-based scoring — rank articles and display as possible context.
+    Stage 4: Deliver notification (placeholder).
     """
     separator = "=" * 72
     logger.warning(separator)
@@ -88,16 +89,16 @@ def on_event(event: MovementEvent) -> None:
     # ── Stage 2: News ingestion ──────────────────────────────────────────────
     articles = _fetch_and_log_news(event)
 
-    # ── Stage 3: Causal analysis ─────────────────────────────────────────────
+    # ── Stage 3: Rule-based ranking & context display ────────────────────────
     top_articles = rank_for_causality(
         articles,
         event_time=event.detected_at,
         top_n=config.CAUSAL_TOP_N_ARTICLES,
     )
     result = _analyzer.analyse(event, top_articles)
-    _log_causal_result(result)
+    _log_causal_result(result, event, top_articles)
 
-    # ── Stage 4: Notification (Iteration 4 placeholder) ─────────────────────
+    # ── Stage 4: Notification (placeholder) ─────────────────────────────────
     # notifier.send(event, result)  # TODO
 
 
@@ -156,19 +157,66 @@ def _fetch_and_log_news(event: MovementEvent) -> list[NewsArticle]:
     return articles
 
 
-def _log_causal_result(result: CausalResult) -> None:
+def _log_causal_result(
+    result: CausalResult,
+    event: MovementEvent | None = None,
+    top_articles: list | None = None,
+) -> None:
     """
-    Log the causal analysis result to the console and log file.
-    Fallback results are flagged clearly so users know the LLM was unavailable.
+    Log the rule-based news context result to the console and log file.
+
+    Displays up to 5 ranked articles with:
+      - rank number
+      - pre-event / post-event timing label
+      - headline
+      - source name
+      - publication time
+      - relevance score
+      - URL
+
+    Post-event articles are clearly distinguished so they are not
+    mistaken for causal evidence.
     """
     sep = "~" * 72
-    tag = "[FALLBACK] " if result.is_fallback else ""
     logger.warning(sep)
-    logger.warning("CAUSAL ANALYSIS  %s[%s]", tag, result.confidence.upper())
-    logger.warning("  %s", result.explanation)
-    if result.source_refs:
-        refs = "; ".join(result.source_refs[:3])
-        logger.warning("  Sources: %s", refs)
+    logger.warning("RELEVANT NEWS CONTEXT  [%s]", result.confidence.upper())
+
+    if result.confidence == "none" or not result.source_refs:
+        logger.warning("  %s", result.explanation)
+        logger.warning(sep)
+        return
+
+    # Print the header line
+    from causal_analyzer import _timing_label
+    from datetime import timezone
+    logger.warning(
+        "  Possible context for the %s move (%s). "
+        "Ranked news around the event window:",
+        event.direction.lower() if event else "?",
+        f"{event.pct_change:+.2f}%" if event else "",
+    )
+    logger.warning(
+        "  NOTE: Post-event articles report on the move — they are NOT evidence of its cause."
+    )
+
+    articles_to_show = top_articles or []
+    for i, sa in enumerate(articles_to_show, 1):
+        art    = sa.article
+        ev_t   = event.detected_at if event else None
+        timing = _timing_label(art.published_at, ev_t) if ev_t else "?"
+        pub    = art.published_at
+        if pub.tzinfo is None:
+            pub = pub.replace(tzinfo=timezone.utc)
+
+        logger.warning("")
+        logger.warning("  [%d] %s", i, art.title)
+        logger.warning("       Source  : %s", art.source_name)
+        logger.warning("       Time    : %s  [%s]",
+                       pub.strftime("%Y-%m-%d %H:%M UTC"), timing)
+        logger.warning("       Score   : %.3f  (relevance=%.1f)",
+                       sa.causal_score, art.relevance_score)
+        logger.warning("       URL     : %s", art.url)
+
     logger.warning(sep)
 
 
@@ -201,7 +249,7 @@ def run_backtest(
     if age_days < 0:
         logger.error("--date %s is in the future. Use a past date.", backtest_date)
         sys.exit(1)
-    if age_days > 7:
+    if age_days > 29:
         logger.error(
             "--date %s is %d days ago. yfinance only stores ~7 days of 1-min data. "
             "Use a more recent date or switch to a coarser interval.",
@@ -216,7 +264,7 @@ def run_backtest(
     logger.info("Window       : %d min", config.WINDOW_MINUTES)
     logger.info("Threshold    : %.2f%%", config.ANOMALY_THRESHOLD_PERCENT)
     if detect_only:
-        logger.info("Mode         : DETECT-ONLY (no NewsAPI / Gemini calls)")
+        logger.info("Mode         : DETECT-ONLY (no NewsAPI calls)")
 
     total_events = 0
 
@@ -373,7 +421,7 @@ def main() -> None:
         dest="detect_only",
         help=(
             "Backtest mode only: run price detection and print event counts "
-            "without making any NewsAPI or Gemini calls."
+            "without making any NewsAPI calls."
         ),
     )
     parser.add_argument(
