@@ -32,10 +32,12 @@ All timestamps are stored as UTC-aware datetimes.
 from __future__ import annotations
 
 import logging
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import requests
 
@@ -221,12 +223,13 @@ class NewsAPISource(NewsSource):
         if not title or title == "[Removed]":
             return None
 
+        publisher = (raw.get("source") or {}).get("name") or self.name
         return NewsArticle(
             title=title,
             description=(raw.get("description") or "").strip(),
             url=raw.get("url") or "",
             published_at=published_at,
-            source_name=self.name,
+            source_name=publisher.strip(),
         )
 
 
@@ -263,10 +266,22 @@ class NewsIngester:
     }
 
     # Default broad query — cast wide; the relevance filter narrows down
-    _BASE_QUERY = (
-        "Nifty OR Sensex OR NSE OR BSE OR \"stock market\" OR \"Indian market\" "
-        "OR RBI OR SEBI"
+    _BASE_QUERY = "Nifty OR Sensex OR NSE OR BSE OR \"stock market\" OR \"Indian market\""
+    _CONTEXT_QUERIES: tuple[str, ...] = (
+        "(Sensex OR Nifty OR NSE OR BSE OR \"Indian market\") AND (sell-off OR selloff OR fall OR drop OR slump OR correction)",
+        "(India OR Indian) AND (\"crude oil\" OR Brent OR WTI OR OPEC)",
+        "(India OR Indian) AND (FII OR FPI OR \"foreign institutional\" OR \"foreign portfolio\") AND (outflow OR selling OR sell-off)",
+        "(India OR Indian) AND (\"US Treasury yield\" OR \"US Treasury yields\" OR \"bond yield\")",
+        "(rupee OR INR) AND (weakness OR weakens OR fall OR depreciation) AND (India OR Indian)",
+        "(\"West Asia\" OR \"Middle East\" OR geopolitical OR geopolitics) AND (India OR Indian)",
+        "(auto sector OR auto stocks OR automobile sector) AND (India OR Indian)",
     )
+    _BROAD_MARKET_RE = re.compile(
+        r"\b(Sensex|Nifty|NSE|BSE|Dalal Street|Indian (?:market|bourses|equities|stocks)|"
+        r"market (?:sell-?off|fall|drop|slump|correction|decline)|benchmark index)\b",
+        re.IGNORECASE,
+    )
+    _TRACKING_QUERY_PARAMS = frozenset({"fbclid", "gclid", "mc_cid", "mc_eid"})
 
     def __init__(self) -> None:
         self._sources: list[NewsSource] = []
@@ -321,13 +336,7 @@ class NewsIngester:
         from_time = event_time - timedelta(minutes=win)
         to_time = event_time + timedelta(minutes=win)
 
-        index_name = self._SYMBOL_NAMES.get(event_symbol, event_symbol)
-        # Only prepend index_name if it isn't already in the base query,
-        # to avoid duplicates like "Nifty OR Nifty OR Sensex OR ...".
-        if index_name.lower() in self._BASE_QUERY.lower():
-            query = self._BASE_QUERY
-        else:
-            query = f"{index_name} OR {self._BASE_QUERY}"
+        queries = self._queries_for_symbol(event_symbol)
 
         logger.info(
             "News fetch: symbol=%s  window=+/-%d min  [%s -> %s]",
@@ -337,10 +346,23 @@ class NewsIngester:
         )
 
         # Collect from all sources, deduplicate by normalised URL
-        seen_urls: set[str] = set()
+        seen_articles: set[str] = set()
         raw_articles: list[NewsArticle] = []
 
         for source in self._sources:
+            for query in queries:
+                try:
+                    results = source.fetch(query, from_time, to_time, max_articles=max_arts)
+                except Exception as exc:
+                    logger.error("Source %s raised unexpectedly: %s", source.name, exc)
+                    results = []
+
+                for art in results:
+                    dedupe_key = self._dedupe_key(art)
+                    if dedupe_key not in seen_articles:
+                        seen_articles.add(dedupe_key)
+                        raw_articles.append(art)
+            continue
             try:
                 results = source.fetch(query, from_time, to_time, max_articles=max_arts)
             except Exception as exc:
@@ -350,9 +372,9 @@ class NewsIngester:
                 results = []
 
             for art in results:
-                norm_url = art.url.rstrip("/").lower()
-                if norm_url not in seen_urls:
-                    seen_urls.add(norm_url)
+                norm_url = self._dedupe_key(art)
+                if norm_url not in seen_articles:
+                    seen_articles.add(norm_url)
                     raw_articles.append(art)
 
         logger.info(
@@ -386,8 +408,43 @@ class NewsIngester:
             )
 
         # Sort: highest relevance first, then most recent
-        filtered.sort(key=lambda a: (-a.relevance_score, -a.published_at.timestamp()))
+        filtered.sort(key=lambda a: self._ranking_key(a, event_time))
         return filtered
+
+    @classmethod
+    def _queries_for_symbol(cls, event_symbol: str) -> tuple[str, ...]:
+        """Return distinct NewsAPI searches for an index movement event."""
+        index_name = cls._SYMBOL_NAMES.get(event_symbol, event_symbol)
+        index_query = cls._BASE_QUERY
+        if index_name.lower() not in index_query.lower():
+            index_query = f"{index_name} OR {index_query}"
+        return (index_query, *cls._CONTEXT_QUERIES)
+
+    @classmethod
+    def _dedupe_key(cls, article: NewsArticle) -> str:
+        """Canonicalise a URL for matching without changing the displayed URL."""
+        if article.url:
+            parts = urlsplit(article.url)
+            query = urlencode(sorted(
+                (key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True)
+                if not key.lower().startswith("utm_") and key.lower() not in cls._TRACKING_QUERY_PARAMS
+            ))
+            canonical = urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path.rstrip("/"), query, ""))
+            return f"url:{canonical.lower()}"
+        title = re.sub(r"\s+", " ", article.title).strip().lower()
+        return f"fallback:{title}|{article.published_at.isoformat()}|{article.source_name.lower()}"
+
+    @classmethod
+    def _ranking_key(cls, article: NewsArticle, event_time: datetime) -> tuple[float, int, float, float]:
+        published = article.published_at
+        if published.tzinfo is None:
+            published = published.replace(tzinfo=timezone.utc)
+        if event_time.tzinfo is None:
+            event_time = event_time.replace(tzinfo=timezone.utc)
+        is_post_event = published > event_time
+        distance_minutes = abs((published - event_time).total_seconds()) / 60.0
+        broad_market = bool(cls._BROAD_MARKET_RE.search(f"{article.title} {article.description}"))
+        return (-float(broad_market), int(is_post_event), distance_minutes, -article.relevance_score)
 
 
 # ── Convenience factory ───────────────────────────────────────────────────────

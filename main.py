@@ -22,6 +22,7 @@ import argparse
 import logging
 import sys
 import time
+import unicodedata
 from datetime import date as _date
 from datetime import datetime, timedelta, timezone
 
@@ -30,9 +31,20 @@ import price_monitor as pm
 from detector import check_window, scan_series_for_events, MovementEvent
 from news_fetcher import NewsIngester, build_default_ingester, NewsArticle
 from causal_prefilter import rank_for_causality
-from causal_analyzer import CausalAnalyzer, CausalResult, build_default_analyzer
+from causal_analyzer import (
+    CausalAnalyzer,
+    CausalResult,
+    build_default_analyzer,
+    pre_event_articles,
+    select_causal_articles,
+)
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except (AttributeError, OSError):
+    pass
 
 _stream_handler = logging.StreamHandler(sys.stdout)
 _stream_handler.setLevel(logging.INFO)
@@ -58,6 +70,17 @@ _analyzer: CausalAnalyzer = build_default_analyzer()
 # When False: one-line-per-article summary (default, screenshot-friendly).
 # When True:  full detail — snippet, timestamp, URL per article.
 _verbose: bool = False
+
+
+def _console_safe_text(value: object) -> str:
+    """Remove invisible control characters and replace console-unsafe glyphs."""
+    text = unicodedata.normalize("NFC", str(value))
+    text = "".join(char for char in text if unicodedata.category(char) != "Cf")
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    try:
+        return text.encode(encoding, errors="replace").decode(encoding)
+    except LookupError:
+        return text.encode("utf-8", errors="replace").decode("utf-8")
 
 
 # ── Event handling ────────────────────────────────────────────────────────────
@@ -90,11 +113,15 @@ def on_event(event: MovementEvent) -> None:
     articles = _fetch_and_log_news(event)
 
     # ── Stage 3: Rule-based ranking & context display ────────────────────────
-    top_articles = rank_for_causality(
-        articles,
+    causal_candidates = pre_event_articles(articles, event.detected_at)
+    ranked_articles = rank_for_causality(
+        causal_candidates,
         event_time=event.detected_at,
-        top_n=config.CAUSAL_TOP_N_ARTICLES,
+        top_n=len(causal_candidates),
     )
+    top_articles = select_causal_articles(
+        ranked_articles, event.detected_at
+    )[:config.CAUSAL_TOP_N_ARTICLES]
     result = _analyzer.analyse(event, top_articles)
     _log_causal_result(result, event, top_articles)
 
@@ -135,7 +162,7 @@ def _fetch_and_log_news(event: MovementEvent) -> list[NewsArticle]:
             # ── Verbose: full four-line block ──────────────────────────────
             logger.info("  [%d] [score=%.1f] %s", i, art.relevance_score, art.title)
             if art.description:
-                logger.info("      %s", art.description[:120])
+                logger.info("      %s", _console_safe_text(art.description[:120]))
             logger.info("      Published: %s | Source: %s",
                         art.published_at.strftime("%Y-%m-%d %H:%M UTC"),
                         art.source_name)
@@ -145,7 +172,8 @@ def _fetch_and_log_news(event: MovementEvent) -> list[NewsArticle]:
             logger.info("  [%d] [%.1f] %s  (%s)",
                         i, art.relevance_score, art.title, art.source_name)
             # Always preserve full detail at DEBUG so the log file has it
-            logger.debug("      snippet  : %s", art.description[:120] if art.description else "—")
+            snippet = art.description[:120] if art.description else "—"
+            logger.debug("      snippet  : %s", _console_safe_text(snippet))
             logger.debug("      published: %s", art.published_at.strftime("%Y-%m-%d %H:%M UTC"))
             logger.debug("      url      : %s", art.url)
 

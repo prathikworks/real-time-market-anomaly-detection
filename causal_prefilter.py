@@ -253,17 +253,18 @@ def rank_for_causality(
 
 def _recency_score(art: "NewsArticle", event_time: datetime, halflife: float) -> float:
     """
-    Exponential decay: score = exp(-ln2 * dt / halflife).
-    Articles published AT event_time score 1.0; articles published
-    halflife minutes away score 0.5.
+    Exponential decay: score = exp(-ln2 * dt / halflife).  Post-event
+    articles receive a further penalty: they may describe the move, but are
+    not advance evidence for it.
     """
     pub = art.published_at
     if pub.tzinfo is None:
         pub = pub.replace(tzinfo=timezone.utc)
     if event_time.tzinfo is None:
         event_time = event_time.replace(tzinfo=timezone.utc)
-    dt_minutes = abs((event_time - pub).total_seconds()) / 60.0
-    return math.exp(-math.log(2) * dt_minutes / halflife)
+    signed_minutes = (pub - event_time).total_seconds() / 60.0
+    score = math.exp(-math.log(2) * abs(signed_minutes) / halflife)
+    return score * 0.35 if signed_minutes > 0 else score
 
 
 def _keyword_score(art: "NewsArticle") -> float:

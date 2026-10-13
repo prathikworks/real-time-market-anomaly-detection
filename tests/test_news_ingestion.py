@@ -340,6 +340,38 @@ class TestNewsIngester:
 # ══════════════════════════════════════════════════════════════════════════════
 
 
+class TestMarketContextRetrieval:
+    def test_context_queries_cover_october_market_drivers(self):
+        from news_fetcher import NewsIngester
+        queries = " ".join(NewsIngester._queries_for_symbol("^BSESN")).lower()
+        for term in ("crude oil", "fii", "fpi", "treasury", "rupee", "west asia", "auto sector"):
+            assert term in queries
+
+    def test_deduplication_removes_tracking_url_variants(self):
+        from news_fetcher import NewsIngester
+        first = make_article("Sensex falls", url="https://example.com/story?utm_source=newsletter")
+        second = make_article("Sensex falls", url="https://example.com/story?fbclid=abc")
+        assert NewsIngester._dedupe_key(first) == NewsIngester._dedupe_key(second)
+
+    def test_broad_pre_event_context_outranks_post_event_stock_story(self):
+        from news_fetcher import NewsIngester
+        event = EVENT_TIME
+        broad_pre = make_article(
+            "Sensex falls as FPI outflows and crude oil weigh on Indian market",
+            url="https://example.com/broad",
+            published_at=event - timedelta(minutes=2),
+        )
+        stock_post = make_article(
+            "Company shares fall after results",
+            url="https://example.com/stock",
+            published_at=event + timedelta(minutes=1),
+        )
+        ingester = NewsIngester()
+        ingester.register_source(_mock_source("MockSource", [stock_post, broad_pre]))
+        results = ingester.fetch_for_event(SYMBOL, event, min_relevance_score=1.0)
+        assert results[0].title == broad_pre.title
+
+
 class TestNewsAPISourceParser:
     """Tests for the internal _parse_article method of NewsAPISource.
 
@@ -398,7 +430,7 @@ class TestNewsAPISourceParser:
         assert art.published_at.tzinfo is not None
         assert art.published_at.utcoffset().total_seconds() == 0
 
-    def test_source_name_is_newsapi(self):
+    def test_source_name_preserves_newsapi_publisher(self):
         src = self._make_source()
         art = src._parse_article(self._valid_raw())
-        assert art.source_name == "NewsAPI"
+        assert art.source_name == "Reuters"

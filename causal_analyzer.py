@@ -105,6 +105,14 @@ _MACRO_SIGNALS: list[re.Pattern] = [
     re.compile(r"\b(Sensex|Nifty|BSE|NSE|Dalal Street)\b", re.IGNORECASE),
 ]
 
+_CAUSAL_CONTEXT_SIGNAL = re.compile(
+    r"\b(FII|FPI|foreign.?institutional|foreign.?portfolio|crude oil|Brent|WTI|OPEC|"
+    r"rupee|INR|US Treasury yields?|bond yields?|West Asia|Middle East|"
+    r"geopolit\w*|RBI|repo rate|monetary policy|inflation|CPI|WPI|"
+    r"sanctions?|global sell.?off)\b",
+    re.IGNORECASE,
+)
+
 
 def _count_macro_signals(text: str) -> int:
     """Count how many distinct macro-signal categories appear in *text*."""
@@ -169,6 +177,39 @@ def _timing_label(art_time: datetime, event_time: datetime) -> str:
     return "pre-event" if pub <= ev else "post-event"
 
 
+def pre_event_articles(articles: list, event_time: datetime) -> list:
+    """Return only articles published at or before *event_time*.
+
+    The helper accepts either NewsArticle instances or ScoredArticle wrappers
+    so the same rule is applied before causal ranking and again defensively
+    inside the analyzer.
+    """
+    event_utc = event_time if event_time.tzinfo else event_time.replace(tzinfo=timezone.utc)
+    eligible: list = []
+    for item in articles:
+        article = getattr(item, "article", item)
+        published = article.published_at
+        if published.tzinfo is None:
+            published = published.replace(tzinfo=timezone.utc)
+        if published <= event_utc:
+            eligible.append(item)
+    return eligible
+
+
+def select_causal_articles(
+    articles: "list[ScoredArticle]",
+    event_time: datetime,
+) -> "list[ScoredArticle]":
+    """Keep only pre-event, broad-market articles with a concrete driver."""
+    return [
+        item for item in pre_event_articles(articles, event_time)
+        if item.broadcast_score >= 0.7
+        and _CAUSAL_CONTEXT_SIGNAL.search(
+            f"{item.article.title} {item.article.description}"
+        )
+    ]
+
+
 # ── Main analyzer ─────────────────────────────────────────────────────────────
 
 
@@ -197,15 +238,14 @@ class RuleBasedAnalyzer:
         """
         Build a CausalResult from the pre-scored article list.
 
-        Never fabricates a causal explanation.  Frames all output as
-        "relevant news" or "possible context" found around the event window.
-        Post-event articles are labelled clearly so they are not mistaken
-        for causal evidence.
+        Never fabricates a causal explanation.  Only articles available at or
+        before the event are eligible for possible-cause analysis.
         """
+        top_articles = select_causal_articles(top_articles, event.detected_at)
         if not top_articles:
             logger.info("Rule-based analyzer: no articles — returning no-news result.")
             return CausalResult(
-                explanation="No strongly relevant news found in the selected time window.",
+                explanation="No strongly relevant pre-event news found; cause undetermined.",
                 confidence="none",
                 source_refs=[],
                 is_fallback=False,

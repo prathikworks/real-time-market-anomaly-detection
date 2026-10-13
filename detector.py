@@ -1,3 +1,4 @@
+
 """
 detector.py — Pure, stateless anomaly-detection logic.
 
