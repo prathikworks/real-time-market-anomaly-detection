@@ -38,6 +38,7 @@ from causal_analyzer import (
     pre_event_articles,
     select_causal_articles,
 )
+import notifier
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
 
@@ -70,6 +71,11 @@ _analyzer: CausalAnalyzer = build_default_analyzer()
 # When False: one-line-per-article summary (default, screenshot-friendly).
 # When True:  full detail — snippet, timestamp, URL per article.
 _verbose: bool = False
+
+# Notification flags — set by --notify / --notify-dry-run CLI flags.
+# Default is OFF so existing backtests never send emails.
+_notify: bool = False
+_notify_dry_run: bool = False
 
 
 def _console_safe_text(value: object) -> str:
@@ -125,8 +131,14 @@ def on_event(event: MovementEvent) -> None:
     result = _analyzer.analyse(event, top_articles)
     _log_causal_result(result, event, top_articles)
 
-    # ── Stage 4: Notification (placeholder) ─────────────────────────────────
-    # notifier.send(event, result)  # TODO
+    # ── Stage 4: Email notification ────────────────────────────────────────
+    if _notify or _notify_dry_run:
+        notifier.send_event_email(
+            event,
+            result,
+            top_articles,
+            dry_run=_notify_dry_run,
+        )
 
 
 def _fetch_and_log_news(event: MovementEvent) -> list[NewsArticle]:
@@ -423,7 +435,7 @@ def run_live() -> None:
 
 
 def main() -> None:
-    global _verbose
+    global _verbose, _notify, _notify_dry_run
 
     parser = argparse.ArgumentParser(
         description="Real-Time Market Anomaly Detection — Iterations 1, 2 & 3"
@@ -460,8 +472,29 @@ def main() -> None:
             "Default is one-line-per-article summary."
         ),
     )
+    parser.add_argument(
+        "--notify",
+        action="store_true",
+        help=(
+            "Send an email notification for each detected event. "
+            "Requires SMTP_USER, SMTP_PASSWORD, and EMAIL_TO in .env or environment. "
+            "Default is OFF — backtests never send emails unless this flag is passed."
+        ),
+    )
+    parser.add_argument(
+        "--notify-dry-run",
+        action="store_true",
+        dest="notify_dry_run",
+        help=(
+            "Build the email and print it to the console (and save it to "
+            "logs/last_email.txt) without actually sending it. "
+            "Useful for verifying email formatting without SMTP credentials."
+        ),
+    )
     args = parser.parse_args()
     _verbose = args.verbose
+    _notify = args.notify
+    _notify_dry_run = args.notify_dry_run
 
     if args.backtest or args.detect_only or args.date:
         # Parse --date
